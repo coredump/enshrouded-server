@@ -1,0 +1,63 @@
+# Build the Proton image and publish it to this Forgejo instance's container
+# registry. Forgejo only runs .forgejo/workflows when this directory exists, so
+# the upstream GitHub workflows (Docker Hub, reusable mornedhels workflows) are
+# ignored here; GitHub likewise ignores this file.
+name: publish-image
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - .github/**
+      - README.md
+      - LICENSE
+  workflow_dispatch:
+
+concurrency:
+  group: publish-image-${{ forge.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # `docker` is the runner label backed by ghcr.io/catthehacker/ubuntu:act-22.04
+    # talking to the forgejo-dind sidecar, never the host daemon.
+    runs-on: docker
+    env:
+      REGISTRY_HOST: forge.home.c6p.dev
+      REGISTRY_USER: coredump
+      # Not FORGEJO_TOKEN: the runner injects a per-job token under that name
+      # which can log in but cannot write packages.
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${REGISTRY_TOKEN:-}" ]; then
+            echo "::error::repo secret REGISTRY_TOKEN is missing (needs a PAT with write:package)"
+            exit 1
+          fi
+
+          image="${REGISTRY_HOST}/${REGISTRY_USER}/enshrouded-server"
+          revision="$(git rev-parse --short HEAD)"
+
+          printf '%s' "$REGISTRY_TOKEN" |
+            docker login "$REGISTRY_HOST" --username "$REGISTRY_USER" --password-stdin
+          trap 'docker logout "$REGISTRY_HOST" >/dev/null 2>&1 || true' EXIT
+
+          # --provenance=false: otherwise buildkit pushes unknown/unknown
+          # attestation manifests that Forgejo lists as junk platforms.
+          docker build --pull --provenance=false \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.source=${{ forge.server_url }}/${{ forge.repository }}" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --file dockerfiles/proton.Dockerfile \
+            --tag "$image:$revision" \
+            --tag "$image:latest" \
+            .
+
+          docker push "$image:$revision"
+          docker push "$image:latest"
+          echo "pushed $image:$revision and :latest"
